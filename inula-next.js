@@ -536,7 +536,9 @@ var CompNode = class extends DLNode {
     if ("_$notInitd" in this)
       return;
     this.updateState(bit);
-    this._$updateView(bit);
+    if (!inMount()) {
+      this._$updateView(bit);
+    }
   }
   /**
    *
@@ -1378,8 +1380,17 @@ function createComponent(compUpdater) {
   currentComp.setUpdateFunc(compUpdater);
   return currentComp;
 }
-function notCached() {
-  return true;
+function notCached(node, cacheSymbol, cacheValues) {
+  if (!cacheValues || !cacheValues.length)
+    return false;
+  if (!node.$nonkeyedCache) {
+    node.$nonkeyedCache = {};
+  }
+  if (!cached(cacheValues, node.$nonkeyedCache[cacheSymbol])) {
+    return true;
+  }
+  node.$nonkeyedCache[cacheSymbol] = cacheValues;
+  return false;
 }
 function didMount() {
   throw new Error("lifecycle should be compiled, check the babel plugin");
