@@ -239,14 +239,43 @@ function cache(el, key, deps) {
   el[cacheKey] = deps;
   return false;
 }
-function setStyle(el, value) {
-  Object.entries(value).forEach(([key, value2]) => {
-    if (key.startsWith("--")) {
-      el.style.setProperty(key, value2);
-    } else {
-      el.style[key] = value2;
+var isCustomProperty = (name) => name.startsWith("--");
+function setStyle(el, newStyle) {
+  const style = el.style;
+  const prevStyle = el._prevStyle || {};
+  for (const key in prevStyle) {
+    if (prevStyle.hasOwnProperty(key) && (newStyle == null || !newStyle.hasOwnProperty(key))) {
+      if (isCustomProperty(key)) {
+        style.removeProperty(key);
+      } else if (key === "float") {
+        style.cssFloat = "";
+      } else {
+        style[key] = "";
+      }
     }
-  });
+  }
+  for (const key in newStyle) {
+    const prevValue = prevStyle[key];
+    const newValue = newStyle[key];
+    if (newStyle.hasOwnProperty(key) && newValue !== prevValue) {
+      if (newValue == null || newValue === "" || typeof newValue === "boolean") {
+        if (isCustomProperty(key)) {
+          style.removeProperty(key);
+        } else if (key === "float") {
+          style.cssFloat = "";
+        } else {
+          style[key] = "";
+        }
+      } else if (isCustomProperty(key)) {
+        style.setProperty(key, newStyle);
+      } else if (key === "float") {
+        style.cssFloat = newStyle;
+      } else {
+        el.style[key] = newValue;
+      }
+    }
+  }
+  el._prevStyle = { ...newStyle };
 }
 function setDataset(el, value) {
   Object.assign(el.dataset, value);
@@ -1387,9 +1416,9 @@ function notCached(node, cacheSymbol, cacheValues) {
     node.$nonkeyedCache = {};
   }
   if (!cached(cacheValues, node.$nonkeyedCache[cacheSymbol])) {
+    node.$nonkeyedCache[cacheSymbol] = cacheValues;
     return true;
   }
-  node.$nonkeyedCache[cacheSymbol] = cacheValues;
   return false;
 }
 function didMount() {
