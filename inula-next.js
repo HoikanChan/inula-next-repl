@@ -74,7 +74,7 @@ var loopShallowElements = (nodes, runFunc) => {
       continue;
     if (node instanceof HTMLElement || node instanceof Text) {
       runFunc(node);
-    } else if (node.nodes) {
+    } else if (node.nodes && node.inulaType !== 8 /* Portal */) {
       stack.push(...[...node.nodes].reverse());
     }
   }
@@ -82,7 +82,7 @@ var loopShallowElements = (nodes, runFunc) => {
 var addParentElement = (nodes, parentEl) => {
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i];
-    if ("inulaType" in node) {
+    if (node && "inulaType" in node) {
       node.parentEl = parentEl;
       node.nodes && addParentElement(node.nodes, parentEl);
     }
@@ -151,7 +151,7 @@ var willReact = (dirtyBits, reactBits) => {
 };
 var init = (nodes) => {
   for (let i = 0; i < nodes.length; i++) {
-    update(nodes[i], InitDirtyBitsMask);
+    update(nodes[i]);
   }
 };
 function withDefault(value, defaultValue) {
@@ -175,6 +175,7 @@ var ReactiveNode = class {
   computations;
   derivedCount;
   owner;
+  props = {};
   constructor() {
     this.owner = getCurrentCompNode();
   }
@@ -201,7 +202,7 @@ var ReactiveNode = class {
       const computation = this.computations[i];
       if (computation.length === 1) {
         const [updateFn] = computation;
-        updateFn();
+        updateFn(dirty);
         continue;
       }
       const [updateDerivedFunc, dependenciesFunc, reactBits, cacheKey] = computation;
@@ -227,35 +228,23 @@ var ReactiveNode = class {
       this.updatePropMap = {};
     this.updatePropMap[propName] = [updatePropFunc, waveBits];
   }
-  updateProp(propName, valueFunc, dependencies, reactBits) {
-    if (BUILTIN_PROPS.includes(propName)) {
-      return;
-    }
-    if (!this.updatePropMap)
-      return;
-    if (!(reactBits & this.owner.dirtyBits))
-      return;
-    const cacheKey = `prop$${propName}`;
-    const cachedDeps = this.cachedDependenciesMap?.[cacheKey];
-    if (cached(dependencies, cachedDeps))
-      return;
-    if (this.updatePropMap["$whole$"]) {
-      const [updatePropFunc, waveBits] = this.updatePropMap["$whole$"];
+  executePropUpdate(updatePropMap, propName, valueFunc) {
+    const propValue = valueFunc();
+    if (updatePropMap["$whole$"]) {
+      const [updatePropFunc, waveBits] = updatePropMap["$whole$"];
       if (propName === "*spread*") {
-        this.wave(updatePropFunc(valueFunc()), waveBits);
+        this.wave(updatePropFunc(propValue), waveBits);
       } else {
-        this.wave(updatePropFunc({ [propName]: valueFunc() }), waveBits);
+        this.wave(updatePropFunc({ [propName]: propValue }), waveBits);
       }
-    } else if (this.updatePropMap[propName]) {
-      const [updatePropFunc, waveBits] = this.updatePropMap[propName];
-      this.wave(updatePropFunc(valueFunc()), waveBits);
+    } else if (updatePropMap[propName]) {
+      const [updatePropFunc, waveBits] = updatePropMap[propName];
+      this.wave(updatePropFunc(propValue), waveBits);
+      this.props[propName] = propValue;
     } else {
-      const [updatePropFunc, waveBits] = this.updatePropMap["$rest$"];
-      this.wave(updatePropFunc({ [propName]: valueFunc() }), waveBits);
+      const [updatePropFunc, waveBits] = updatePropMap["$rest$"];
+      this.wave(updatePropFunc({ [propName]: propValue }), waveBits);
     }
-    if (!this.cachedDependenciesMap)
-      this.cachedDependenciesMap = {};
-    this.cachedDependenciesMap[cacheKey] = dependencies;
   }
   // ---- PROP END ----
   // ---- CONTEXT START ----
@@ -266,8 +255,27 @@ var ReactiveNode = class {
     this.updateContextMap[contextName] = [context.id, updateContextFunc, waveBits];
   }
   updateContext(contextId, contextName, value) {
-    if (!this.updateContextMap || !(contextName in this.updateContextMap))
-      return;
+    if (this.updateContextMap) {
+      if (contextName === "*spread*") {
+        for (const key in this.updateContextMap) {
+          if (key in value) {
+            this.doUpdateContext(contextId, key, value);
+          }
+        }
+        if ("$whole$" in this.updateContextMap) {
+          this.doUpdateContext(contextId, "$whole$", value);
+        }
+      } else {
+        if (this.updateContextMap[contextName]) {
+          this.doUpdateContext(contextId, contextName, value);
+        }
+        if ("$whole$" in this.updateContextMap) {
+          this.doUpdateContext(contextId, "$whole$", { [contextName]: value });
+        }
+      }
+    }
+  }
+  doUpdateContext(contextId, contextName, value) {
     const [expectedContextId, updateContextFunc, waveBits] = this.updateContextMap[contextName];
     if (contextId !== expectedContextId)
       return;
@@ -275,18 +283,18 @@ var ReactiveNode = class {
   }
   // ---- CONTEXT END ----
   // ---- HOOKS START ----
-  useHook(hookNode, updateHookReturn, hookUpdater) {
-    updateHookReturn(hookNode.value());
+  useHook(hookNode, emit, hookUpdater) {
+    emit(hookNode.value());
     hookNode.triggerUpdate = () => {
-      updateHookReturn(hookNode.value());
+      emit(hookNode.value());
     };
-    hookUpdater(hookNode);
     if (!this.computations)
       this.computations = [];
     if (this.derivedCount === void 0)
       this.derivedCount = 0;
     this.computations.push([
-      () => {
+      (dirty) => {
+        hookNode.propDirtyBits = dirty;
         hookUpdater(hookNode);
       }
     ]);
@@ -311,6 +319,11 @@ var CompNode = class extends ReactiveNode {
   updater;
   subComponents;
   slices;
+  unmounted = false;
+  type;
+  setUnmounted = () => {
+    this.unmounted = true;
+  };
   constructor(parentComponents) {
     super();
     for (let i = 0; i < parentComponents.length; i++) {
@@ -320,15 +333,30 @@ var CompNode = class extends ReactiveNode {
         parentComponents[i].subComponents = [this];
       }
     }
+    this.didMount(() => {
+      this.unmounted = false;
+    });
     this.dirtyBits = InitDirtyBitsMask;
+  }
+  updateProp(propName, valueFunc, dependencies, reactBits) {
+    if (BUILTIN_PROPS.includes(propName)) {
+      return;
+    }
+    if (!this.updatePropMap)
+      return;
+    if (!(reactBits & this.owner.dirtyBits))
+      return;
+    const cacheKey = `prop$${propName}`;
+    const cachedDeps = this.cachedDependenciesMap?.[cacheKey];
+    if (cached(dependencies, cachedDeps))
+      return;
+    this.executePropUpdate(this.updatePropMap, propName, valueFunc);
+    if (!this.cachedDependenciesMap)
+      this.cachedDependenciesMap = {};
+    this.cachedDependenciesMap[cacheKey] = dependencies;
   }
   // ---- In component update START----
   wave(_, dirty) {
-    if (this.dirtyBits && this.dirtyBits !== InitDirtyBitsMask) {
-      this.dirtyBits |= dirty;
-      return;
-    }
-    this.dirtyBits = dirty;
     this.updateState(dirty);
     this.updateViewAsync(dirty);
   }
@@ -339,7 +367,15 @@ var CompNode = class extends ReactiveNode {
    * @returns
    */
   updateViewAsync(dirty) {
+    if (this.dirtyBits && this.dirtyBits !== InitDirtyBitsMask) {
+      this.dirtyBits |= dirty;
+      return;
+    }
+    this.dirtyBits = dirty;
     schedule(() => {
+      if (this.unmounted) {
+        return;
+      }
       for (let i = 0; i < (this.nodes?.length ?? 0); i++) {
         update(this.nodes[i]);
       }
@@ -356,7 +392,9 @@ var CompNode = class extends ReactiveNode {
     return this;
   }
   init(node) {
-    this.nodes = [node];
+    if (node) {
+      this.nodes = [node];
+    }
     compStack.pop();
     delete this.dirtyBits;
     return this;
@@ -377,8 +415,12 @@ var createCompNode = (compFn, props, updater) => {
     Object.assign(props, spreadProps);
   }
   const compNode = compFn(props);
-  if (updater)
-    compNode.updater = updater;
+  if (compNode) {
+    compNode.props = props;
+    compNode.type = compFn;
+    if (updater)
+      compNode.updater = updater;
+  }
   return compNode;
 };
 function createChildren(nodesFn, compNode) {
@@ -545,20 +587,20 @@ var eventHandler = (e) => {
   }
 };
 var _delegateEvent = (node, key, value) => {
-  if (node[`de$${key}`])
-    return;
-  node[`de$${key}`] = value;
-  if (!InulaStore.delegatedEvents.has(key)) {
-    InulaStore.delegatedEvents.add(key);
-    InulaStore.document.addEventListener(key, eventHandler);
+  if (!node[`de$${key}`]) {
+    if (!InulaStore.delegatedEvents.has(key)) {
+      InulaStore.delegatedEvents.add(key);
+      InulaStore.document.addEventListener(key, eventHandler);
+    }
   }
+  node[`de$${key}`] = value;
 };
 var setHTMLProp = (node, key, valueFunc, dependencies, reactBits) => {
   if (!shouldUpdate(node, key, dependencies, reactBits))
     return;
   _setHTMLProp(node, key, valueFunc());
 };
-var setStyle = (node, newStyleFunc, dependencies, reactBits) => {
+function setStyle(node, newStyleFunc, dependencies, reactBits) {
   if (reactBits) {
     if (!shouldUpdate(node, "style", dependencies, reactBits))
       return;
@@ -566,7 +608,7 @@ var setStyle = (node, newStyleFunc, dependencies, reactBits) => {
   } else {
     _setStyle(node, newStyleFunc);
   }
-};
+}
 var setDataset = (node, valueFunc, dependencies, reactBits) => {
   if (!shouldUpdate(node, "dataset", dependencies, reactBits))
     return;
@@ -592,11 +634,19 @@ var setHTMLAttr = (node, key, valueFunc, dependencies, reactBits) => {
       return;
     _setHTMLAttr(node, key, valueFunc());
   } else {
-    _setHTMLProps(node, valueFunc);
+    _setHTMLAttr(node, key, valueFunc);
   }
 };
 var setEvent = _setEvent;
-var delegateEvent = _delegateEvent;
+var delegateEvent = (node, key, valueFunc, dependencies, reactBits) => {
+  if (reactBits) {
+    if (!shouldUpdate(node, key, dependencies, reactBits))
+      return;
+    _delegateEvent(node, key, valueFunc());
+  } else {
+    _delegateEvent(node, key, valueFunc);
+  }
+};
 function setRef(node, refFn) {
   if (node.__$owner.dirtyBits === InitDirtyBitsMask) {
     refFn();
@@ -630,7 +680,6 @@ var createTemplateNode = (template, getUpdater, ...nodesToInsert) => {
   node.__$owner = getCurrentCompNode();
   const updater = getUpdater?.(node) ?? null;
   node.update = _update2.bind(null, node, updater);
-  node.dirtyBits = InitDirtyBitsMask;
   if (nodesToInsert.length > 0) {
     const insertOperations = [];
     for (let i = 0; i < nodesToInsert.length; i++) {
@@ -688,13 +737,12 @@ var render = (compNode, container) => {
 var FragmentNode = class {
   inulaType = 7 /* Fragment */;
   nodes;
-  dirtyBits;
   constructor(nodes) {
     this.nodes = nodes;
   }
   update() {
     for (let i = 0; i < this.nodes.length; i++) {
-      update(this.nodes[i], this.dirtyBits);
+      update(this.nodes[i]);
     }
   }
 };
@@ -744,7 +792,14 @@ var ContextNode = class {
     if (cached(deps, cachedDeps))
       return;
     const value = valueFunc();
-    this.contexts[contextName] = value;
+    if (contextName === "*spread*") {
+      this.contexts = {
+        ...this.contexts,
+        ...value
+      };
+    } else {
+      this.contexts[contextName] = value;
+    }
     this.consumers.forEach((consumer) => consumer.updateContext(this.contextId, contextName, value));
     this.cachedDependenciesMap[contextName] = deps;
   }
@@ -828,10 +883,10 @@ var MutableContextNode = class {
    * @param nodes
    * @param removeEl Only remove outermost element
    */
-  removeNodes(nodes) {
-    loopShallowElements(nodes, (node) => {
-      this.parentEl.removeChild(node);
-    });
+  removeNodes(nodes, parentEl) {
+    if (!parentEl)
+      parentEl = this.parentEl;
+    removeNodes(nodes, parentEl);
   }
   initUnmountStore() {
     if (!InulaStore.global.WillUnmountScopedStore)
@@ -842,27 +897,49 @@ var MutableContextNode = class {
     InulaStore.global.DidUnmountScopedStore.push([]);
   }
 };
+function removeNodes(nodes, parentEl) {
+  const stack = [...nodes].reverse();
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node == null)
+      continue;
+    if (node instanceof HTMLElement || node instanceof Text) {
+      parentEl.removeChild(node);
+    } else if (node.inulaType === 8 /* Portal */) {
+      const portalNode = node;
+      removeNodes(portalNode.nodes, portalNode.target);
+    } else if (node.nodes) {
+      if (node.willUnmountScopedStore?.length > 0) {
+        node.runWillUnmount();
+      }
+      stack.push(...[...node.nodes].reverse());
+    }
+  }
+}
 
 // src/Nodes/MutableNodes/lifecycle.ts
 var MutableLifecycleNode = class extends MutableContextNode {
   willUnmountScopedStore;
   didUnmountScopedStore;
+  constructor() {
+    super();
+  }
   setUnmountFuncs() {
     this.willUnmountScopedStore = InulaStore.global.WillUnmountScopedStore.pop();
-    this.didUnmountScopedStore = InulaStore.global.WillUnmountScopedStore.pop();
+    this.didUnmountScopedStore = InulaStore.global.DidUnmountScopedStore.pop();
   }
-  runWillUnmount() {
+  runWillUnmount = () => {
     if (!this.willUnmountScopedStore)
       return;
     for (let i = 0; i < this.willUnmountScopedStore.length; i++)
       this.willUnmountScopedStore[i]();
-  }
-  runDidUnmount() {
+  };
+  runDidUnmount = () => {
     if (!this.didUnmountScopedStore)
       return;
     for (let i = this.didUnmountScopedStore.length - 1; i >= 0; i--)
       this.didUnmountScopedStore[i]();
-  }
+  };
   removeNodes(nodes) {
     this.runWillUnmount();
     super.removeNodes(nodes);
@@ -878,38 +955,86 @@ var MutableLifecycleNode = class extends MutableContextNode {
   }
 };
 
-// src/Nodes/MutableNodes/expression.ts
-var ExpNode = class extends MutableLifecycleNode {
-  inulaType = 2 /* Cond */;
-  nodes;
-  updater;
-  reactBits;
-  dependenciesFunc;
-  cachedDeps;
-  constructor(updater, dependenciesFunc, reactBits) {
-    super();
-    this.updater = updater;
-    this.reactBits = reactBits;
-    this.dependenciesFunc = dependenciesFunc;
-    this.initUnmountStore();
-    this.nodes = this.getExpressionResult();
-    this.setUnmountFuncs();
+// src/Nodes/MutableNodes/Suspense.ts
+var suspenseContext = null;
+function getSuspenseContext() {
+  if (!suspenseContext) {
+    suspenseContext = createContext();
   }
-  update() {
-    if (!(this.reactBits & this.owner.dirtyBits))
+  return suspenseContext;
+}
+var SuspenseNode = class extends MutableLifecycleNode {
+  inulaType = 9 /* Suspense */;
+  didSuspend = false;
+  promiseSet = /* @__PURE__ */ new Set();
+  fallbackNode;
+  children;
+  contextNode;
+  nodes = [];
+  constructor() {
+    super();
+    this.contextNode = createContextNode(getSuspenseContext(), ($$node) => {
+      $$node.updateContext("handlePromise", () => this.handlePromise.bind(this), [], 0);
+    });
+    this.nodes = [this.contextNode];
+  }
+  with(children) {
+    this.children = children;
+    if (!this.didSuspend) {
+      this.contextNode.with(...this.children);
+    }
+    return this;
+  }
+  fallback(fallback) {
+    this.fallbackNode = fallback();
+    return this;
+  }
+  clearPromise(promise) {
+    this.promiseSet.delete(promise);
+    if (this.promiseSet.size === 0) {
+      this.didSuspend = false;
+      this.toggle();
+    }
+  }
+  handlePromise(promise) {
+    if (this.promiseSet.has(promise))
       return;
-    if (cached(this.dependenciesFunc(), this.cachedDeps))
-      return;
+    if (this.didSuspend === false) {
+      this.didSuspend = true;
+      this.toggle();
+    }
+    this.promiseSet.add(promise);
+    const clear = this.clearPromise.bind(this, promise);
+    promise.then(clear, clear);
+  }
+  toggle() {
+    const compNode = getCurrentCompNode();
+    if (compNode && compNode.dirtyBits === InitDirtyBitsMask) {
+      this.contextNode.nodes = this.getCurrentContent();
+    } else {
+      this.render();
+    }
+  }
+  getCurrentContent() {
+    if (this.didSuspend) {
+      return [this.fallbackNode];
+    } else {
+      return this.children;
+    }
+  }
+  render() {
     const prevFuncs = [this.willUnmountScopedStore, this.didUnmountScopedStore];
-    const newNodes = this.newNodesInContext(() => this.getExpressionResult());
+    const newNodes = this.newNodesInContext(() => {
+      return this.getCurrentContent();
+    });
     const newFuncs = [this.willUnmountScopedStore, this.didUnmountScopedStore];
     [this.willUnmountScopedStore, this.didUnmountScopedStore] = prevFuncs;
-    if (this.nodes && this.nodes.length > 0) {
-      this.removeNodes(this.nodes);
+    if (this.contextNode.nodes && this.contextNode.nodes.length > 0) {
+      this.removeNodes(this.contextNode.nodes);
     }
     [this.willUnmountScopedStore, this.didUnmountScopedStore] = newFuncs;
-    this.nodes = newNodes;
-    if (this.nodes.length === 0)
+    this.contextNode.nodes = newNodes;
+    if (this.contextNode.nodes.length === 0)
       return;
     const flowIndex = getFlowIndexFromNodes(this.parentEl.nodes, this);
     const nextSibling = this.parentEl.childNodes[flowIndex];
@@ -917,24 +1042,144 @@ var ExpNode = class extends MutableLifecycleNode {
     init(this.nodes);
     runDidMount();
   }
-  getExpressionResult() {
-    let nodes = this.updater();
-    if (!Array.isArray(nodes))
-      nodes = [nodes];
-    return nodes.flat(1).map((node) => {
-      if (typeof node === "string" || typeof node === "number" || typeof node === "bigint") {
-        return createTextNode(`${node}`, () => {
-        });
-      }
-      if (typeof node === "function" && node.$$isChildren) {
-        return node();
-      }
-      return node;
-    }).flat(1).filter((node) => node !== void 0 && node !== null && typeof node !== "boolean");
+  update() {
+    for (let i = 0; i < (this.nodes?.length ?? 0); i++) {
+      update(this.nodes[i]);
+    }
   }
 };
-var createExpNode = (updater, dependenciesFunc, reactBits) => {
-  return new ExpNode(updater, dependenciesFunc, reactBits);
+function createSuspenseNode() {
+  return new SuspenseNode();
+}
+function lazy(promiseConstructor) {
+  let value = null;
+  let promise = null;
+  let status = "init";
+  const instance = {
+    nodes: []
+  };
+  return function(props) {
+    const { handlePromise } = useContext(getSuspenseContext());
+    if (status === "init") {
+      status = "pending";
+      promise = promiseConstructor();
+      promise.then(
+        function(module) {
+          value = module.default;
+          status = "fullfilled";
+          instance.nodes = [value(props)];
+        },
+        function(error) {
+          status = "rejected";
+          value = error;
+        }
+      );
+    }
+    if (status !== "fullfilled") {
+      handlePromise(promise);
+    }
+    return instance;
+  };
+}
+
+// src/Nodes/UtilNodes/ErrorBoundary.ts
+function catchError(fn, handler) {
+  try {
+    return fn();
+  } catch (error) {
+    handler(error);
+    return null;
+  }
+}
+function ErrorBoundary({
+  fallback,
+  children
+}) {
+  const $$self = compBuilder();
+  let error = null;
+  function handler(err) {
+    $$self.wave(
+      error = err,
+      4
+      /*0b100*/
+    );
+  }
+  return $$self.prepare().init(
+    createConditionalNode(($$node) => {
+      if ($$node.cachedCondition(0, () => error, [error])) {
+        if ($$node.branch(0))
+          return [];
+        return [
+          createExpNode(
+            () => fallback(error),
+            () => [fallback],
+            1
+          )
+        ];
+      } else {
+        if ($$node.branch(1))
+          return [];
+        return [
+          createExpNode(
+            () => catchError(children, handler),
+            () => [children],
+            2
+          )
+        ];
+      }
+    }, 4)
+  );
+}
+
+// src/Nodes/UtilNodes/Portal.ts
+function updatePortal(node) {
+  for (let i = 0; i < node.nodes.length; i++) {
+    update(node.nodes[i]);
+  }
+}
+function createPortal(props, ...children) {
+  const target = props.target ?? InulaStore.document.body;
+  appendNodes(children, target);
+  addParentElement(children, target);
+  return { inulaType: 8 /* Portal */, target, nodes: children, update: updatePortal };
+}
+function Portal(props) {
+  throw new Error("Portal should be compiled to a createPortal");
+}
+
+// src/Nodes/HookNode/index.tsx
+var HookNode = class extends ReactiveNode {
+  value;
+  triggerUpdate;
+  propDirtyBits = 0;
+  updateProp = (propName, valueFunc, dependencies, reactBits) => {
+    if (!this.updatePropMap)
+      return;
+    if (!(reactBits & this.propDirtyBits))
+      return;
+    const cacheKey = `prop$${propName}`;
+    const cachedDeps = this.cachedDependenciesMap?.[cacheKey];
+    if (cached(dependencies, cachedDeps))
+      return;
+    this.executePropUpdate(this.updatePropMap, propName, valueFunc);
+    if (!this.cachedDependenciesMap)
+      this.cachedDependenciesMap = {};
+    this.cachedDependenciesMap[cacheKey] = dependencies;
+  };
+  constructor() {
+    super();
+  }
+  wave(_, dirty) {
+    this.updateState(dirty);
+    this.triggerUpdate?.();
+  }
+  init(value, dependencies, reactBits) {
+    this.value = value;
+    return this;
+  }
+};
+var hookBuilder = () => {
+  return new HookNode();
 };
 
 // src/Nodes/MutableNodes/conditional.ts
@@ -998,88 +1243,6 @@ var ConditionalNode = class extends MutableLifecycleNode {
 };
 var createConditionalNode = (updater, reactBits) => {
   return new ConditionalNode(updater, reactBits);
-};
-
-// src/Nodes/UtilNodes/Suspense.ts
-var suspenseContext = null;
-function getSuspenseContext() {
-  if (!suspenseContext) {
-    suspenseContext = createContext();
-  }
-  return suspenseContext;
-}
-function Suspense({
-  fallback,
-  children
-}) {
-  const $$self = compBuilder();
-  $$self.addProp("fallback", (value) => fallback = value, 1);
-  $$self.addProp("children", (value) => children = value, 2);
-  let didSuspend = false;
-  function resolve(toSuspend) {
-    $$self.wave(
-      didSuspend = toSuspend,
-      4
-      /*0b100*/
-    );
-  }
-  return $$self.prepare().init(createContextNode(getSuspenseContext(), ($$node) => {
-    $$node.updateContext("resolve", () => resolve, [], 0);
-  }).with(createConditionalNode(($$node) => {
-    if ($$node.cachedCondition(0, () => didSuspend, [didSuspend])) {
-      if ($$node.branch(0))
-        return [];
-      return [createExpNode(() => fallback, () => [fallback], 1)];
-    } else {
-      if ($$node.branch(1))
-        return [];
-      return [createExpNode(() => children, () => [children], 2)];
-    }
-  }, 4)));
-}
-function lazy(promiseConstructor) {
-  let result = null;
-  let status = "init";
-  return function(props) {
-    const {
-      resolve
-    } = useContext(getSuspenseContext());
-    if (status === "init") {
-      resolve(true);
-      promiseConstructor().then(function(module) {
-        result = module.default;
-        status = "fullfilled";
-        resolve(false);
-      }, function(error) {
-        status = "rejected";
-        result = error;
-      });
-    }
-    if (status === "fullfilled") {
-      return result(props);
-    }
-    return null;
-  };
-}
-
-// src/Nodes/HookNode/index.ts
-var HookNode = class extends ReactiveNode {
-  value;
-  triggerUpdate;
-  constructor() {
-    super();
-  }
-  wave(_, dirty) {
-    this.updateState(dirty);
-    this.triggerUpdate?.();
-  }
-  init(value) {
-    this.value = value;
-    return this;
-  }
-};
-var hookBuilder = () => {
-  return new HookNode();
 };
 
 // src/Nodes/MutableNodes/for.ts
@@ -1177,6 +1340,11 @@ var ForNode = class extends MutableContextNode {
       return;
     }
     this.updateItems();
+  }
+  unmount() {
+    this.runAllWillUnmount();
+    this.parentEl.innerHTML = "";
+    this.runAllDidUnmount();
   }
   /**
    * @brief Array-related update function
@@ -1457,6 +1625,65 @@ var createForNode = (dataFunc, keysFunc, nodeFunc, dataReactBits) => {
   return new ForNode(dataFunc, keysFunc, nodeFunc, dataReactBits);
 };
 
+// src/Nodes/MutableNodes/expression.ts
+var ExpNode = class extends MutableLifecycleNode {
+  inulaType = 2 /* Cond */;
+  nodes;
+  updater;
+  reactBits;
+  dependenciesFunc;
+  cachedDeps;
+  constructor(updater, dependenciesFunc, reactBits) {
+    super();
+    this.updater = updater;
+    this.reactBits = reactBits;
+    this.dependenciesFunc = dependenciesFunc;
+    this.initUnmountStore();
+    this.nodes = this.getExpressionResult();
+    this.setUnmountFuncs();
+  }
+  update() {
+    if (!(this.reactBits & this.owner.dirtyBits))
+      return;
+    if (cached(this.dependenciesFunc(), this.cachedDeps))
+      return;
+    const prevFuncs = [this.willUnmountScopedStore, this.didUnmountScopedStore];
+    const newNodes = this.newNodesInContext(() => this.getExpressionResult());
+    const newFuncs = [this.willUnmountScopedStore, this.didUnmountScopedStore];
+    [this.willUnmountScopedStore, this.didUnmountScopedStore] = prevFuncs;
+    if (this.nodes && this.nodes.length > 0) {
+      this.removeNodes(this.nodes);
+    }
+    [this.willUnmountScopedStore, this.didUnmountScopedStore] = newFuncs;
+    this.nodes = newNodes;
+    if (this.nodes.length === 0)
+      return;
+    const flowIndex = getFlowIndexFromNodes(this.parentEl.nodes, this);
+    const nextSibling = this.parentEl.childNodes[flowIndex];
+    appendNodesWithSibling(this.nodes, this.parentEl, nextSibling);
+    init(this.nodes);
+    runDidMount();
+  }
+  getExpressionResult() {
+    let nodes = this.updater();
+    if (!Array.isArray(nodes))
+      nodes = [nodes];
+    return nodes.flat(1).map((node) => {
+      if (typeof node === "string" || typeof node === "number" || typeof node === "bigint") {
+        return createTextNode(`${node}`, () => {
+        });
+      }
+      if (typeof node === "function" && node.$$isChildren) {
+        return node();
+      }
+      return node;
+    }).flat(1).filter((node) => node !== void 0 && node !== null && typeof node !== "boolean");
+  }
+};
+var createExpNode = (updater, dependenciesFunc, reactBits) => {
+  return new ExpNode(updater, dependenciesFunc, reactBits);
+};
+
 // src/Nodes/macros.ts
 function watch(effect) {
   throw new Error("Watch should not be called directly, please check the docs for more information");
@@ -1470,13 +1697,17 @@ function willUnmount(effect) {
 function didUnmount(effect) {
   throw new Error("DidUnmount should not be called directly, please check the docs for more information");
 }
+function untrack(getter) {
+  return getter();
+}
 export {
   CompNode,
   ContextNode,
+  ErrorBoundary,
   HookNode,
   InitDirtyBitsMask,
+  Portal,
   ReactiveNode,
-  Suspense,
   addParentElement,
   appendNodes,
   appendNodesWithIndex,
@@ -1494,6 +1725,8 @@ export {
   createForNode,
   createFragmentNode,
   createHTMLNode,
+  createPortal,
+  createSuspenseNode,
   createTemplate,
   createTemplateNode,
   createTextNode,
@@ -1526,6 +1759,7 @@ export {
   templateAddNodeToUpdate,
   templateGetElement,
   toDOMElements,
+  untrack,
   update,
   useContext,
   watch,
